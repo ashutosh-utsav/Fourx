@@ -1,5 +1,6 @@
-# Ledger and conversation data (SQLite + its side files)
+# Ledger and conversation data (SQLite + its side files), and the posting lock
 ledger.db
+ledger.lock
 *.db
 *.db-journal
 *.db-wal

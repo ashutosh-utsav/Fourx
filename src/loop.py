@@ -13,6 +13,7 @@ import time
 from contextlib import contextmanager
 
 from src import tools
+from src.lock import LedgerBusy, ledger_lock
 from src.providers import PROVIDERS, get_provider
 
 MAX_STEPS = 10  # model calls per clerk message, so a confused model can't loop forever
@@ -52,7 +53,15 @@ def recover(store, out=print) -> None:
     The approval is marked 'posting' before ledger.post is called. If we find one
     still 'posting', we look for its reference in the ledger: found means it was
     posted (we just never got the id back); not found means it never got there.
+
+    We hold the posting lock while doing this, so a post still running in another
+    terminal finishes first and is never mistaken for a crashed one.
     """
+    with ledger_lock(on_wait=lambda: out("(Another session is posting; waiting for it to finish…)")):
+        _recover(store, out)
+
+
+def _recover(store, out) -> None:
     for approval in store.approvals_with_status("posting"):
         found = tools.entries_with_reference(reference_for(approval["id"]))
         if found:
@@ -128,7 +137,14 @@ class Agent:
             self.out("Nothing is waiting for approval.")
             return
         with self._working():
-            result = self._post(approval)
+            try:
+                result = self._post(approval)
+            except LedgerBusy as e:  # nothing was posted; the approval is still waiting
+                self.out(f"Not posted yet: {e}")
+                return
+            if result is None:
+                self.out("That approval was already handled in another session.")
+                return
             self.out(_describe(result))
             self._loop()
 
@@ -210,10 +226,21 @@ class Agent:
             )
         return approval
 
-    def _post(self, approval: dict) -> dict:
-        """Post an approved invoice, safe against a crash at any point."""
-        # 1. Write down that we are about to post, before touching the ledger.
-        self.store.set_approval_status(approval["id"], "posting")
+    def _post(self, approval: dict) -> dict | None:
+        """Post an approved invoice, safe against a crash or a second terminal.
+
+        Returns None if another session already took this approval.
+        """
+        # Only one post at a time across all running copies; Ctrl-C may cancel the wait.
+        with ledger_lock(on_wait=lambda: self.out("  (another session is posting; waiting…)"),
+                         check_stop=self._check_stop):
+            # 1. Claim the approval and write down that we are about to post, before
+            #    touching the ledger. Fails if another session claimed it first.
+            if not self.store.claim_approval(approval["id"]):
+                return None
+            return self._post_locked(approval)
+
+    def _post_locked(self, approval: dict) -> dict:
         reference = reference_for(approval["id"])
         try:
             # 2. Post. Ctrl-C does not abandon this: stopping halfway is what we must avoid.

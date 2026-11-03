@@ -140,6 +140,16 @@ class Store:
                 "UPDATE approvals SET status = ?, updated_at = ? WHERE id = ?", (status, _now(), approval_id)
             )
 
+    def claim_approval(self, approval_id: str) -> bool:
+        """Move waiting -> posting in one step. False if it was no longer waiting
+        (e.g. the same conversation is open in another terminal and got there first)."""
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE approvals SET status = 'posting', updated_at = ? WHERE id = ? AND status = 'waiting'",
+                (_now(), approval_id),
+            )
+        return cur.rowcount == 1
+
     def finish_approval(self, approval: dict, status: str, result: dict) -> None:
         """Record the outcome AND the tool result the model will see, in one transaction."""
         with self.conn:

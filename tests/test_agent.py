@@ -12,7 +12,7 @@ import time
 import pytest
 
 import ledger
-from src import tools
+from src import lock, tools
 from src.loop import Agent, recover, reference_for
 from src.providers import gemini as gemini_provider
 from src.providers import groq as groq_provider
@@ -64,6 +64,7 @@ def assert_history_valid(history):
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger, "DB_PATH", tmp_path / "ledger.db")  # never touch the real ledger
+    monkeypatch.setattr(lock, "LOCK_PATH", tmp_path / "ledger.lock")
     store = Store(tmp_path / "agent.db")
     store.open_conversation("t", "gemini")
     return store
@@ -361,6 +362,96 @@ def test_provider_error_keeps_the_conversation_usable(env):
     agent.send("hi")
     assert "503" in lines[-1]
     assert_history_valid(env.messages("t"))
+
+
+# ------------------------------------------------------------------ two terminals at once
+
+
+def _approve_in_two_sessions(db_path, conv_a, conv_b):
+    """Run /approve in two sessions at the same moment, each with its own database connection
+    (like two terminals). Returns what each session printed."""
+    outputs = {}
+    start = threading.Barrier(2)
+
+    def session(conv):
+        store = Store(db_path)
+        fake = FakeProvider(script=[say("done")])
+        agent, lines = make_agent(store, fake)
+        agent.conv = conv
+        start.wait()
+        agent.approve()
+        outputs[conv] = lines
+
+    threads = [threading.Thread(target=session, args=(c,)) for c in (conv_a, conv_b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    return outputs
+
+
+def test_two_terminals_cannot_post_the_same_invoice(env, tmp_path):
+    """Two conversations both have invoice-01 waiting, and both approve at once."""
+    env.open_conversation("other", "gemini")
+    for conv in ("t", "other"):
+        agent, _ = make_agent(env, FakeProvider(script=[call("post_invoice", invoice_id="invoice-01")]))
+        agent.conv = conv
+        agent.send("post invoice-01")
+    assert env.open_approval("t") and env.open_approval("other")
+
+    _approve_in_two_sessions(tmp_path / "agent.db", "t", "other")
+
+    assert len(posted("SGP/26-27/0412")) == 1
+    statuses = sorted(a["status"] for a in env.approvals_with_status("posted") + env.approvals_with_status("refused"))
+    assert statuses == ["posted", "refused"]
+
+
+def test_same_approval_in_two_terminals(env, tmp_path):
+    """The same conversation is open twice and /approve is typed in both."""
+    agent, _ = make_agent(env, FakeProvider(script=[call("post_invoice", invoice_id="invoice-01")]))
+    agent.send("post invoice-01")
+
+    outputs = _approve_in_two_sessions(tmp_path / "agent.db", "t", "t")
+
+    assert len(posted("SGP/26-27/0412")) == 1
+    assert len(env.approvals_with_status("posted")) == 1
+    assert_history_valid(env.messages("t"))
+
+
+def test_lock_makes_the_second_one_wait(env):
+    held = threading.Event()
+
+    def holder():
+        with lock.ledger_lock():
+            held.set()
+            time.sleep(1)
+
+    threading.Thread(target=holder).start()
+    held.wait()
+    with pytest.raises(lock.LedgerBusy):
+        with lock.ledger_lock(timeout=0.3):
+            pass
+    started = time.monotonic()
+    with lock.ledger_lock(timeout=5):  # waits for the holder, then gets it
+        assert time.monotonic() - started > 0.3
+
+
+def test_lock_is_released_when_a_process_is_killed(env):
+    import signal
+    import subprocess
+    import sys
+
+    code = (f"import time, src.lock as l; l.LOCK_PATH = __import__('pathlib').Path({str(lock.LOCK_PATH)!r})\n"
+            "with l.ledger_lock():\n    print('held', flush=True); time.sleep(60)")
+    proc = subprocess.Popen([sys.executable, "-c", code], cwd=tools.ROOT, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "held"
+    with pytest.raises(lock.LedgerBusy):
+        with lock.ledger_lock(timeout=0.3):
+            pass
+    proc.send_signal(signal.SIGKILL)
+    proc.wait()
+    with lock.ledger_lock(timeout=2):  # the OS released it
+        pass
 
 
 class RateLimited(Exception):
