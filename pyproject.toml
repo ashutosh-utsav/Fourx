@@ -3,4 +3,13 @@ name = "fourx-take-home"
 version = "0.1.0"
 description = "FourX take-home: a small agent harness"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "google-genai>=2.34.0",
+    "groq>=1.7.0",
+    "pytest>=9.2.0",
+    "python-dotenv>=1.2.4",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
